@@ -1,7 +1,7 @@
 import Foundation
 import CoreLocation
 
-enum TransportMode: String, Codable, CaseIterable, Sendable {
+nonisolated enum TransportMode: String, Codable, CaseIterable, Sendable {
     case walk
     case cycle
     case transit
@@ -23,14 +23,14 @@ enum TransportMode: String, Codable, CaseIterable, Sendable {
     }
 }
 
-enum RevealFilter: String, CaseIterable, Identifiable, Sendable {
+nonisolated enum RevealFilter: String, CaseIterable, Identifiable, Sendable {
     case all = "すべて"
     case walkOnly = "徒歩のみ"
 
     var id: String { rawValue }
 }
 
-struct TrackPoint: Identifiable, Codable, Sendable {
+nonisolated struct TrackPoint: Identifiable, Codable, Sendable {
     var id: UUID = UUID()
     let latitude: Double
     let longitude: Double

@@ -2,6 +2,7 @@ import Foundation
 import CoreLocation
 import CoreMotion
 import Combine
+import OSLog
 
 @MainActor
 final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDelegate {
@@ -11,16 +12,32 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
     @Published private(set) var lastLocation: CLLocation?
     @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
 
+    private let logger = Logger(subsystem: "Hiraku", category: "LocationRecorder")
     private let locationManager = CLLocationManager()
     private let activityManager = CMMotionActivityManager()
-    private let storageURL: URL
+    private let pointStore: TrackPointStore
 
     override init() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        self.storageURL = docs.appendingPathComponent("track_points.json")
+        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let loadedPoints = TrackPointStore.loadSynchronously(from: documentsDirectory)
+        self.pointStore = TrackPointStore(documentsDirectory: documentsDirectory)
+        self.points = loadedPoints
+        self.lastLocation = loadedPoints.last.map {
+            CLLocation(
+                coordinate: $0.coordinate,
+                altitude: 0,
+                horizontalAccuracy: $0.horizontalAccuracy,
+                verticalAccuracy: -1,
+                course: -1,
+                speed: $0.speed,
+                timestamp: $0.timestamp
+            )
+        }
         super.init()
-        loadPoints()
         setupLocationManager()
+        Task {
+            await pointStore.bootstrapIfNeeded(with: points)
+        }
     }
 
     private func setupLocationManager() {
@@ -75,7 +92,9 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         locationManager.allowsBackgroundLocationUpdates = false
         activityManager.stopActivityUpdates()
         isRecording = false
-        savePoints()
+        Task {
+            await pointStore.flush()
+        }
     }
 
     private func startMotionTracking() {
@@ -98,52 +117,33 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         let status = manager.authorizationStatus
         Task { @MainActor in
             self.authorizationStatus = status
-            if status == .authorizedAlways || status == .authorizedWhenInUse {
-                if !self.isRecording {
-                    self.startRecording()
-                }
+            if status == .authorizedAlways || status == .authorizedWhenInUse, !self.isRecording {
+                self.startRecording()
             }
         }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         Task { @MainActor in
-            for loc in locations {
-                processLocation(loc)
+            for location in locations {
+                await self.processLocation(location)
             }
         }
     }
 
-    private func processLocation(_ location: CLLocation) {
-        // 精度が悪すぎるノイズ（地下鉄の基地局ジャンプなど）は除外
-        guard location.horizontalAccuracy >= 0, location.horizontalAccuracy <= 120 else { return }
+    private func processLocation(_ location: CLLocation) async {
+        guard shouldAccept(location) else { return }
 
         let inferredMode = classifyMode(for: location, previous: lastLocation)
 
-        // 地下鉄・トンネル対策: 前回地点から時間が空き、かつ一定距離ワープしていたら直線補間して雲を繋げる
-        if let prev = lastLocation {
-            let dt = location.timestamp.timeIntervalSince(prev.timestamp)
-            let dist = location.distance(from: prev)
-            if dt > 20, dist > 150, dist < 30_000 {
-                let avgSpeed = dist / dt // m/s
-                // 地下鉄相当の速度 (約10km/h〜130km/h) なら地上復帰時に間のルートを補間
-                if avgSpeed > 2.8 && avgSpeed < 36.0 {
-                    let steps = max(2, min(80, Int(dist / 60.0)))
-                    for i in 1..<steps {
-                        let ratio = Double(i) / Double(steps)
-                        let lat = prev.coordinate.latitude + (location.coordinate.latitude - prev.coordinate.latitude) * ratio
-                        let lon = prev.coordinate.longitude + (location.coordinate.longitude - prev.coordinate.longitude) * ratio
-                        let interpPoint = TrackPoint(
-                            latitude: lat,
-                            longitude: lon,
-                            timestamp: prev.timestamp.addingTimeInterval(dt * ratio),
-                            horizontalAccuracy: location.horizontalAccuracy,
-                            speed: avgSpeed,
-                            mode: .transit,
-                            isInterpolated: true
-                        )
-                        points.append(interpPoint)
-                    }
+        if let previousLocation = lastLocation {
+            let deltaTime = location.timestamp.timeIntervalSince(previousLocation.timestamp)
+            let distance = location.distance(from: previousLocation)
+            if deltaTime > 20, distance > 150, distance < 30_000 {
+                let averageSpeed = distance / deltaTime
+                if averageSpeed > 2.8 && averageSpeed < 36.0 {
+                    let gapMode = await recoverGapMode(from: previousLocation, to: location, fallback: inferredMode)
+                    appendInterpolatedPoints(from: previousLocation, to: location, mode: gapMode)
                 }
             }
         }
@@ -156,20 +156,45 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             speed: max(0, location.speed),
             mode: inferredMode
         )
-        points.append(newPoint)
+        append(point: newPoint)
         lastLocation = location
-        savePoints()
+    }
+
+    private func shouldAccept(_ location: CLLocation) -> Bool {
+        guard location.horizontalAccuracy >= 0 else { return false }
+        guard location.horizontalAccuracy <= 140 else { return false }
+
+        guard let previousLocation = lastLocation else { return true }
+
+        let distance = location.distance(from: previousLocation)
+        let deltaTime = max(location.timestamp.timeIntervalSince(previousLocation.timestamp), 1)
+        let derivedSpeed = distance / deltaTime
+
+        if location.horizontalAccuracy > 65, distance > 100 {
+            return false
+        }
+
+        if location.horizontalAccuracy > max(35, previousLocation.horizontalAccuracy * 2),
+           distance > max(70, location.horizontalAccuracy * 1.4) {
+            return false
+        }
+
+        if derivedSpeed > 55, location.horizontalAccuracy > 30 {
+            return false
+        }
+
+        return true
     }
 
     private func classifyMode(for location: CLLocation, previous: CLLocation?) -> TransportMode {
         var speed = location.speed
-        if speed < 0, let prev = previous {
-            let dt = location.timestamp.timeIntervalSince(prev.timestamp)
-            if dt > 0 {
-                speed = location.distance(from: prev) / dt
+        if speed < 0, let previous {
+            let deltaTime = location.timestamp.timeIntervalSince(previous.timestamp)
+            if deltaTime > 0 {
+                speed = location.distance(from: previous) / deltaTime
             }
         }
-        // CoreMotionの判定と移動速度を組み合わせる
+
         if currentMode == .walk && speed < 3.2 {
             return .walk
         }
@@ -181,16 +206,79 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         return currentMode
     }
 
-    // MARK: - Persistence
+    private func recoverGapMode(from start: CLLocation, to end: CLLocation, fallback: TransportMode) async -> TransportMode {
+        guard CMMotionActivityManager.isActivityAvailable() else { return fallback }
 
-    private func loadPoints() {
-        guard let data = try? Data(contentsOf: storageURL),
-              let saved = try? JSONDecoder().decode([TrackPoint].self, from: data) else { return }
-        self.points = saved
+        return await withCheckedContinuation { continuation in
+            activityManager.queryActivityStarting(from: start.timestamp, to: end.timestamp, to: .main) { [weak self] activities, error in
+                Task { @MainActor in
+                    if let error {
+                        self?.logger.error("Failed to query motion history: \(error.localizedDescription, privacy: .public)")
+                    }
+                    let resolvedMode = self?.historicalMode(from: activities ?? [], between: start, and: end, fallback: fallback) ?? fallback
+                    continuation.resume(returning: resolvedMode)
+                }
+            }
+        }
     }
 
-    private func savePoints() {
-        guard let data = try? JSONEncoder().encode(points) else { return }
-        try? data.write(to: storageURL, options: .atomic)
+    private func historicalMode(
+        from activities: [CMMotionActivity],
+        between start: CLLocation,
+        and end: CLLocation,
+        fallback: TransportMode
+    ) -> TransportMode {
+        guard !activities.isEmpty else { return fallback }
+
+        let averageSpeed = end.distance(from: start) / max(end.timestamp.timeIntervalSince(start.timestamp), 1)
+
+        let walkingCount = activities.count { $0.walking || $0.running }
+        let cyclingCount = activities.count { $0.cycling }
+        let automotiveCount = activities.count { $0.automotive }
+
+        if cyclingCount > max(walkingCount, automotiveCount) {
+            return .cycle
+        }
+
+        if walkingCount > automotiveCount, averageSpeed < 3.5 {
+            return .walk
+        }
+
+        if automotiveCount > 0 {
+            return averageSpeed > 7.5 ? .transit : .vehicle
+        }
+
+        return fallback
+    }
+
+    private func appendInterpolatedPoints(from start: CLLocation, to end: CLLocation, mode: TransportMode) {
+        let distance = end.distance(from: start)
+        let deltaTime = end.timestamp.timeIntervalSince(start.timestamp)
+        let averageSpeed = distance / max(deltaTime, 1)
+        let stepCount = max(2, min(80, Int(distance / 60.0)))
+
+        for step in 1..<stepCount {
+            let ratio = Double(step) / Double(stepCount)
+            let latitude = start.coordinate.latitude + (end.coordinate.latitude - start.coordinate.latitude) * ratio
+            let longitude = start.coordinate.longitude + (end.coordinate.longitude - start.coordinate.longitude) * ratio
+
+            let interpolatedPoint = TrackPoint(
+                latitude: latitude,
+                longitude: longitude,
+                timestamp: start.timestamp.addingTimeInterval(deltaTime * ratio),
+                horizontalAccuracy: min(start.horizontalAccuracy, end.horizontalAccuracy),
+                speed: averageSpeed,
+                mode: mode,
+                isInterpolated: true
+            )
+            append(point: interpolatedPoint)
+        }
+    }
+
+    private func append(point: TrackPoint) {
+        points.append(point)
+        Task {
+            await pointStore.append(point)
+        }
     }
 }

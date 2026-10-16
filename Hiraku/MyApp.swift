@@ -4,6 +4,7 @@ import SwiftUI
 struct MyApp: App {
     @StateObject private var recorder = LocationRecorder()
     @State private var filter: RevealFilter = .all
+    @State private var centerOnUserTrigger = 0
 
     private var filteredPoints: [TrackPoint] {
         switch filter {
@@ -19,11 +20,33 @@ struct MyApp: App {
             ZStack(alignment: .bottom) {
                 FogMapView(
                     points: filteredPoints,
-                    userLocation: recorder.lastLocation
+                    userLocation: recorder.lastLocation,
+                    centerOnUserTrigger: centerOnUserTrigger
                 )
                 .ignoresSafeArea()
 
-                controlBar
+                VStack {
+                    HStack {
+                        Spacer()
+                        Button {
+                            centerOnUserTrigger += 1
+                        } label: {
+                            Image(systemName: "location.fill")
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                                .frame(width: 44, height: 44)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .disabled(recorder.lastLocation == nil)
+                        .padding(.top, 12)
+                        .padding(.trailing, 16)
+                    }
+
+                    Spacer()
+
+                    controlBar
+                }
+                .ignoresSafeArea(edges: .top)
             }
             .onAppear {
                 recorder.startOnLaunchIfNeeded()
