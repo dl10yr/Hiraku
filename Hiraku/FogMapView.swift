@@ -11,9 +11,9 @@ nonisolated final class OSMTileOverlay: MKTileOverlay {
 
     init() {
         super.init(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-        // Apple Maps のベクター描画を完全に消すと、タイル読み込み前やオフライン時に画面が真っ暗になるため false にする
-        self.canReplaceMapContent = false
-        self.minimumZ = 2
+        // Apple Maps の標準ベクター描画（VectorKit）を置換して、OpenStreetMap のみ表示＆VectorKitのアサーションを防止
+        self.canReplaceMapContent = true
+        self.minimumZ = 0
         self.maximumZ = 19
     }
 
@@ -29,179 +29,147 @@ nonisolated final class OSMTileOverlay: MKTileOverlay {
     }
 }
 
-nonisolated private struct SpatialPointIndex {
-    private struct Cell: Hashable {
-        let latitudeBucket: Int
-        let longitudeBucket: Int
-    }
+/// 訪れた場所だけ雲（霧）をくり抜いて描画する Canvas オーバーレイ View
+/// MKMapView のカスタム MKOverlayRenderer ではなく SwiftUI Canvas で重畳することで、
+/// iOS 27 シミュレータの VectorKit アサーションクラッシュ（EaselUtilities.cpp:376）を完全に回避し、
+/// 60fps で滑らかなソフトエッジの雲を描画します。
+struct FogCanvasOverlay: View {
+    let points: [TrackPoint]
+    let region: MKCoordinateRegion
 
-    private let cellSizeDegrees: Double = 0.002
-    private var buckets: [Cell: [TrackPoint]] = [:]
+    var body: some View {
+        Canvas { context, size in
+            guard size.width > 0, size.height > 0 else { return }
 
-    init(points: [TrackPoint]) {
-        rebuild(with: points)
-    }
+            // Canvas 内部を独立レイヤーにして destinationOut（くり抜き合成）を機能させる
+            context.drawLayer { layer in
+                // 1. 画面全体を「雲（白い霧〜スモーク）」で覆う
+                let fullRect = CGRect(origin: .zero, size: size)
+                layer.fill(
+                    Path(fullRect),
+                    with: .color(Color(red: 0.14, green: 0.17, blue: 0.22).opacity(0.76))
+                )
 
-    mutating func rebuild(with points: [TrackPoint]) {
-        buckets.removeAll(keepingCapacity: true)
-        for point in points {
-            buckets[cell(for: point.coordinate), default: []].append(point)
-        }
-    }
+                guard !points.isEmpty,
+                      region.span.latitudeDelta > 0,
+                      region.span.longitudeDelta > 0 else { return }
 
-    func points(in mapRect: MKMapRect, paddingMeters: CLLocationDistance) -> [TrackPoint] {
-        let topLeft = MKMapPoint(x: mapRect.minX, y: mapRect.minY).coordinate
-        let bottomRight = MKMapPoint(x: mapRect.maxX, y: mapRect.maxY).coordinate
+                // 1メートルあたりの画面ピクセル数を算出
+                let metersPerDegreeLat = 111_132.0
+                let visibleMetersLat = region.span.latitudeDelta * metersPerDegreeLat
+                let pixelsPerMeter = size.height / max(visibleMetersLat, 1)
 
-        let centerLatitude = (topLeft.latitude + bottomRight.latitude) / 2
-        let latitudePadding = paddingMeters / 111_000
-        let longitudeScale = max(0.2, cos(centerLatitude * .pi / 180))
-        let longitudePadding = paddingMeters / (111_000 * longitudeScale)
+                // 表示範囲＋マージン内のポイントだけ抽出
+                let latMargin = region.span.latitudeDelta * 0.6
+                let lonMargin = region.span.longitudeDelta * 0.6
+                let minLat = region.center.latitude - region.span.latitudeDelta / 2 - latMargin
+                let maxLat = region.center.latitude + region.span.latitudeDelta / 2 + latMargin
+                let minLon = region.center.longitude - region.span.longitudeDelta / 2 - lonMargin
+                let maxLon = region.center.longitude + region.span.longitudeDelta / 2 + lonMargin
 
-        let minLatitude = min(topLeft.latitude, bottomRight.latitude) - latitudePadding
-        let maxLatitude = max(topLeft.latitude, bottomRight.latitude) + latitudePadding
-        let minLongitude = min(topLeft.longitude, bottomRight.longitude) - longitudePadding
-        let maxLongitude = max(topLeft.longitude, bottomRight.longitude) + longitudePadding
+                let visiblePoints = points.filter { pt in
+                    pt.latitude >= minLat && pt.latitude <= maxLat &&
+                    pt.longitude >= minLon && pt.longitude <= maxLon
+                }
 
-        let minLatBucket = bucketIndex(for: minLatitude)
-        let maxLatBucket = bucketIndex(for: maxLatitude)
-        let minLonBucket = bucketIndex(for: minLongitude)
-        let maxLonBucket = bucketIndex(for: maxLongitude)
+                guard !visiblePoints.isEmpty else { return }
 
-        // ズームアウトしすぎてセル数が膨大な場合は全探索にフォールバック（ハング防止）
-        let latSpan = maxLatBucket - minLatBucket + 1
-        let lonSpan = maxLonBucket - minLonBucket + 1
-        if latSpan <= 0 || lonSpan <= 0 || latSpan * lonSpan > 2_500 {
-            return buckets.values.flatMap { $0 }.sorted { $0.timestamp < $1.timestamp }
-        }
+                layer.blendMode = .destinationOut
 
-        var result: [TrackPoint] = []
-        result.reserveCapacity(min(512, latSpan * lonSpan * 4))
+                // 2. 訪れた地点と連続する軌跡の雲をソフトエッジでくり抜く
+                for (index, pt) in visiblePoints.enumerated() {
+                    let screenPt = convertToScreen(
+                        coordinate: pt.coordinate,
+                        in: size,
+                        region: region
+                    )
+                    // ズームアウトしすぎた時でも最低 14pt は見えるようにする
+                    let radiusPx = max(14.0, CGFloat(pt.revealRadius) * pixelsPerMeter)
 
-        for latitudeBucket in minLatBucket...maxLatBucket {
-            for longitudeBucket in minLonBucket...maxLonBucket {
-                let cell = Cell(latitudeBucket: latitudeBucket, longitudeBucket: longitudeBucket)
-                if let bucketPoints = buckets[cell] {
-                    result.append(contentsOf: bucketPoints)
+                    // 外側のふんわりした境界（ソフトエッジ）
+                    let outerRadius = radiusPx * 1.45
+                    let outerRect = CGRect(
+                        x: screenPt.x - outerRadius,
+                        y: screenPt.y - outerRadius,
+                        width: outerRadius * 2,
+                        height: outerRadius * 2
+                    )
+                    layer.fill(
+                        Path(ellipseIn: outerRect),
+                        with: .radialGradient(
+                            Gradient(stops: [
+                                .init(color: .white, location: 0.0),
+                                .init(color: .white.opacity(0.85), location: 0.55),
+                                .init(color: .clear, location: 1.0)
+                            ]),
+                            center: screenPt,
+                            startRadius: 0,
+                            endRadius: outerRadius
+                        )
+                    )
+
+                    // 連続するポイント間を太いラインで繋ぐ
+                    if index > 0 {
+                        let prev = visiblePoints[index - 1]
+                        let dt = pt.timestamp.timeIntervalSince(prev.timestamp)
+                        let dist = CLLocation(latitude: pt.latitude, longitude: pt.longitude)
+                            .distance(from: CLLocation(latitude: prev.latitude, longitude: prev.longitude))
+                        if dt <= 240 && dist <= 400 {
+                            let prevScreenPt = convertToScreen(
+                                coordinate: prev.coordinate,
+                                in: size,
+                                region: region
+                            )
+                            var linePath = Path()
+                            linePath.move(to: prevScreenPt)
+                            linePath.addLine(to: screenPt)
+
+                            layer.stroke(
+                                linePath,
+                                with: .color(.white.opacity(0.45)),
+                                style: StrokeStyle(lineWidth: radiusPx * 2.5, lineCap: .round, lineJoin: .round)
+                            )
+                            layer.stroke(
+                                linePath,
+                                with: .color(.white),
+                                style: StrokeStyle(lineWidth: radiusPx * 1.8, lineCap: .round, lineJoin: .round)
+                            )
+                        }
+                    }
                 }
             }
         }
-
-        return result.sorted { $0.timestamp < $1.timestamp }
+        .allowsHitTesting(false)
     }
 
-    private func cell(for coordinate: CLLocationCoordinate2D) -> Cell {
-        Cell(
-            latitudeBucket: bucketIndex(for: coordinate.latitude),
-            longitudeBucket: bucketIndex(for: coordinate.longitude)
+    private func convertToScreen(
+        coordinate: CLLocationCoordinate2D,
+        in size: CGSize,
+        region: MKCoordinateRegion
+    ) -> CGPoint {
+        let minLat = region.center.latitude - region.span.latitudeDelta / 2
+        let maxLat = region.center.latitude + region.span.latitudeDelta / 2
+        let minLon = region.center.longitude - region.span.longitudeDelta / 2
+        let maxLon = region.center.longitude + region.span.longitudeDelta / 2
+
+        let xRatio = (coordinate.longitude - minLon) / max(maxLon - minLon, 0.000001)
+        let yRatio = (maxLat - coordinate.latitude) / max(maxLat - minLat, 0.000001)
+
+        return CGPoint(
+            x: CGFloat(xRatio) * size.width,
+            y: CGFloat(yRatio) * size.height
         )
     }
-
-    private func bucketIndex(for value: Double) -> Int {
-        Int(floor(value / cellSizeDegrees))
-    }
 }
 
-/// 地図全体を覆う「雲（霧）」のオーバーレイ
-nonisolated final class FogOverlay: NSObject, MKOverlay {
-    let coordinate = CLLocationCoordinate2D(latitude: 0, longitude: 0)
-    let boundingMapRect = MKMapRect.world
-
-    private let lock = NSLock()
-    private var _points: [TrackPoint]
-    private var pointIndex: SpatialPointIndex
-
-    var points: [TrackPoint] {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return _points
-        }
-        set {
-            lock.lock()
-            _points = newValue
-            pointIndex.rebuild(with: newValue)
-            lock.unlock()
-        }
-    }
-
-    init(points: [TrackPoint]) {
-        self._points = points
-        self.pointIndex = SpatialPointIndex(points: points)
-    }
-
-    func visiblePoints(in mapRect: MKMapRect, paddingMeters: CLLocationDistance) -> [TrackPoint] {
-        lock.lock()
-        defer { lock.unlock() }
-        return pointIndex.points(in: mapRect, paddingMeters: paddingMeters)
-    }
-}
-
-/// 訪れた場所だけ雲をくり抜くレンダラー（MapKit のバックグラウンド描画スレッドで動作するため nonisolated）
-nonisolated final class FogOverlayRenderer: MKOverlayRenderer {
-    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        guard let fogOverlay = overlay as? FogOverlay else { return }
-
-        let rect = self.rect(for: mapRect)
-        context.saveGState()
-        context.setAllowsAntialiasing(true)
-        context.setShouldAntialias(true)
-
-        // 1. 雲（半透明の白霧〜スモーク）で地図を覆う（うっすら下の地形が見える程度にして「真っ黒で何も表示されない」を防ぐ）
-        context.setFillColor(UIColor(red: 0.12, green: 0.15, blue: 0.20, alpha: 0.68).cgColor)
-        context.fill(rect)
-
-        let visiblePoints = fogOverlay.visiblePoints(in: mapRect, paddingMeters: 420)
-        guard !visiblePoints.isEmpty else {
-            context.restoreGState()
-            return
-        }
-
-        // 2. 訪れた座標と移動軌跡の雲をくり抜く
-        context.setBlendMode(.clear)
-        context.setLineCap(.round)
-        context.setLineJoin(.round)
-
-        // 各ポイントの半径分しっかり円形にくり抜く + 近接するポイント間を太い線で繋ぐ
-        for (index, point) in visiblePoints.enumerated() {
-            let mapPoint = MKMapPoint(point.coordinate)
-            let radiusInMapPoints = point.revealRadius * MKMapPointsPerMeterAtLatitude(point.latitude)
-            let pointMapRect = MKMapRect(
-                x: mapPoint.x - radiusInMapPoints,
-                y: mapPoint.y - radiusInMapPoints,
-                width: radiusInMapPoints * 2,
-                height: radiusInMapPoints * 2
-            )
-            let drawRect = self.rect(for: pointMapRect)
-            context.fillEllipse(in: drawRect)
-
-            if index > 0 {
-                let prev = visiblePoints[index - 1]
-                let dt = point.timestamp.timeIntervalSince(prev.timestamp)
-                let prevMapPoint = MKMapPoint(prev.coordinate)
-                let meters = mapPoint.distance(to: prevMapPoint)
-                if dt <= 240 && meters <= 350 {
-                    let p1 = self.point(for: prevMapPoint)
-                    let p2 = self.point(for: mapPoint)
-                    context.setLineWidth(drawRect.width)
-                    context.move(to: p1)
-                    context.addLine(to: p2)
-                    context.strokePath()
-                }
-            }
-        }
-
-        context.restoreGState()
-    }
-}
-
-struct FogMapView: UIViewRepresentable {
-    let points: [TrackPoint]
+/// OpenStreetMap タイルを表示し、カメラ移動をリアルタイムに通知する MKMapView ラッパー
+struct OSMMapView: UIViewRepresentable {
     let userLocation: CLLocation?
     let centerOnUserTrigger: Int
+    @Binding var region: MKCoordinateRegion
 
     func makeCoordinator() -> Coordinator {
-        Coordinator()
+        Coordinator(self)
     }
 
     func makeUIView(context: Context) -> MKMapView {
@@ -209,22 +177,16 @@ struct FogMapView: UIViewRepresentable {
         mapView.delegate = context.coordinator
         mapView.showsUserLocation = true
         mapView.showsCompass = false
-
-        // 位置情報未取得時でも日本（東京駅周辺）が初期表示されるように設定
-        let defaultCenter = userLocation?.coordinate ?? CLLocationCoordinate2D(latitude: 35.6812, longitude: 139.7671)
-        let initialRegion = MKCoordinateRegion(
-            center: defaultCenter,
-            latitudinalMeters: 1500,
-            longitudinalMeters: 1500
-        )
-        mapView.setRegion(initialRegion, animated: false)
+        mapView.isPitchEnabled = false
+        mapView.isRotateEnabled = false
 
         let osm = OSMTileOverlay()
         mapView.addOverlay(osm, level: .aboveLabels)
 
-        let fog = FogOverlay(points: points)
-        context.coordinator.fogOverlay = fog
-        mapView.addOverlay(fog, level: .aboveLabels)
+        if let loc = userLocation {
+            context.coordinator.hasCenteredOnUser = true
+            center(mapView, on: loc, animated: false)
+        }
 
         return mapView
     }
@@ -240,42 +202,71 @@ struct FogMapView: UIViewRepresentable {
             context.coordinator.hasCenteredOnUser = true
             center(mapView, on: loc, animated: true)
         }
-
-        if context.coordinator.lastPointsCount != points.count || context.coordinator.lastPointID != points.last?.id {
-            context.coordinator.lastPointsCount = points.count
-            context.coordinator.lastPointID = points.last?.id
-            context.coordinator.fogOverlay?.points = points
-            if let fog = context.coordinator.fogOverlay,
-               let renderer = mapView.renderer(for: fog) as? FogOverlayRenderer {
-                renderer.setNeedsDisplay()
-            }
-        }
     }
 
     private func center(_ mapView: MKMapView, on location: CLLocation, animated: Bool) {
-        let region = MKCoordinateRegion(
+        let newRegion = MKCoordinateRegion(
             center: location.coordinate,
-            latitudinalMeters: 1200,
-            longitudinalMeters: 1200
+            latitudinalMeters: 1000,
+            longitudinalMeters: 1000
         )
-        mapView.setRegion(region, animated: animated)
+        mapView.setRegion(newRegion, animated: animated)
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
-        var fogOverlay: FogOverlay?
+        var parent: OSMMapView
         var hasCenteredOnUser = false
         var lastCenterTrigger = 0
-        var lastPointsCount = -1
-        var lastPointID: UUID?
+
+        init(_ parent: OSMMapView) {
+            self.parent = parent
+        }
+
+        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
+            let currentRegion = mapView.region
+            Task { @MainActor in
+                self.parent.region = currentRegion
+            }
+        }
+
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            let currentRegion = mapView.region
+            Task { @MainActor in
+                self.parent.region = currentRegion
+            }
+        }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let tileOverlay = overlay as? MKTileOverlay {
                 return MKTileOverlayRenderer(tileOverlay: tileOverlay)
             }
-            if let fog = overlay as? FogOverlay {
-                return FogOverlayRenderer(overlay: fog)
-            }
             return MKOverlayRenderer(overlay: overlay)
+        }
+    }
+}
+
+struct FogMapView: View {
+    let points: [TrackPoint]
+    let userLocation: CLLocation?
+    let centerOnUserTrigger: Int
+
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 37.3346, longitude: -122.0090),
+        latitudinalMeters: 2000,
+        longitudinalMeters: 2000
+    )
+
+    var body: some View {
+        ZStack {
+            OSMMapView(
+                userLocation: userLocation,
+                centerOnUserTrigger: centerOnUserTrigger,
+                region: $region
+            )
+            FogCanvasOverlay(
+                points: points,
+                region: region
+            )
         }
     }
 }

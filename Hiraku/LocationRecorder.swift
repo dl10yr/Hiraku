@@ -87,7 +87,11 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         locationManager.showsBackgroundLocationIndicator = true
         #endif
         locationManager.startUpdatingLocation()
-        locationManager.requestLocation()
+        if let cached = locationManager.location {
+            Task { @MainActor in
+                await self.processLocation(cached)
+            }
+        }
         startMotionTracking()
         isRecording = true
     }
@@ -139,6 +143,10 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Task { @MainActor in
+            // kCLError.locationUnknown (Code 0) は測位中（またはシミュレータのLocation=None時）の一時的な状態なので無視して測位継続
+            if (error as NSError).code == CLError.locationUnknown.rawValue {
+                return
+            }
             self.logger.warning("Location manager error: \(error.localizedDescription, privacy: .public)")
         }
     }
