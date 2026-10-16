@@ -2,7 +2,7 @@ import SwiftUI
 
 @main
 struct MyApp: App {
-    @State private var recorder = LocationRecorder()
+    @StateObject private var recorder = LocationRecorder()
     @State private var filter: RevealFilter = .all
 
     private var filteredPoints: [TrackPoint] {

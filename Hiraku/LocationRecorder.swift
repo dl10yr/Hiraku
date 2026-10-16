@@ -1,16 +1,15 @@
 import Foundation
 import CoreLocation
 import CoreMotion
-import Observation
+import Combine
 
-@Observable
 @MainActor
-final class LocationRecorder: NSObject, CLLocationManagerDelegate {
-    private(set) var points: [TrackPoint] = []
-    private(set) var isRecording: Bool = false
-    private(set) var currentMode: TransportMode = .walk
-    private(set) var lastLocation: CLLocation?
-    private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
+final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDelegate {
+    @Published private(set) var points: [TrackPoint] = []
+    @Published private(set) var isRecording: Bool = false
+    @Published private(set) var currentMode: TransportMode = .walk
+    @Published private(set) var lastLocation: CLLocation?
+    @Published private(set) var authorizationStatus: CLAuthorizationStatus = .notDetermined
 
     private let locationManager = CLLocationManager()
     private let activityManager = CMMotionActivityManager()
