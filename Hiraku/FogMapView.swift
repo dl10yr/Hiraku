@@ -192,14 +192,23 @@ struct OSMMapView: UIViewRepresentable {
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
-        if !context.coordinator.hasCenteredOnUser, let loc = userLocation {
-            context.coordinator.hasCenteredOnUser = true
-            center(mapView, on: loc, animated: true)
+        if let loc = userLocation {
+            let jumpedFar: Bool = {
+                guard let lastCentered = context.coordinator.lastCenteredLocation else { return true }
+                return loc.distance(from: lastCentered) > 2_000
+            }()
+
+            if !context.coordinator.hasCenteredOnUser || jumpedFar {
+                context.coordinator.hasCenteredOnUser = true
+                context.coordinator.lastCenteredLocation = loc
+                center(mapView, on: loc, animated: true)
+            }
         }
 
         if context.coordinator.lastCenterTrigger != centerOnUserTrigger, let loc = userLocation {
             context.coordinator.lastCenterTrigger = centerOnUserTrigger
             context.coordinator.hasCenteredOnUser = true
+            context.coordinator.lastCenteredLocation = loc
             center(mapView, on: loc, animated: true)
         }
     }
@@ -216,6 +225,7 @@ struct OSMMapView: UIViewRepresentable {
     final class Coordinator: NSObject, MKMapViewDelegate {
         var parent: OSMMapView
         var hasCenteredOnUser = false
+        var lastCenteredLocation: CLLocation?
         var lastCenterTrigger = 0
 
         init(_ parent: OSMMapView) {

@@ -19,7 +19,10 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
 
     override init() {
         let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let loadedPoints = TrackPointStore.loadSynchronously(from: documentsDirectory)
+        // 前回のフォールバックで保存された東京駅ダミー座標 (35.6812, 139.7671) が残っていれば除外
+        let loadedPoints = TrackPointStore.loadSynchronously(from: documentsDirectory).filter {
+            !(abs($0.latitude - 35.6812) < 0.0001 && abs($0.longitude - 139.7671) < 0.0001)
+        }
         self.pointStore = TrackPointStore(documentsDirectory: documentsDirectory)
         self.points = loadedPoints
         self.lastLocation = loadedPoints.last.map {
@@ -187,19 +190,15 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
         guard let previousLocation = lastLocation else { return true }
 
         let distance = location.distance(from: previousLocation)
-        let deltaTime = max(location.timestamp.timeIntervalSince(previousLocation.timestamp), 1)
-        let derivedSpeed = distance / deltaTime
 
+        // 精度が悪い（>65m）のに100m以上飛んだ場合のみ、基地局/Wi-Fiノイズとして除外する
+        // （シミュレータのロケーション切り替えや高精度GPSでの移動は horizontalAccuracy が良いため受け入れる）
         if location.horizontalAccuracy > 65, distance > 100 {
             return false
         }
 
-        if location.horizontalAccuracy > max(35, previousLocation.horizontalAccuracy * 2),
-           distance > max(70, location.horizontalAccuracy * 1.4) {
-            return false
-        }
-
-        if derivedSpeed > 55, location.horizontalAccuracy > 30 {
+        if location.horizontalAccuracy > max(50, previousLocation.horizontalAccuracy * 2.5),
+           distance > max(100, location.horizontalAccuracy * 1.8) {
             return false
         }
 
