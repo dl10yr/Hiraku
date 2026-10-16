@@ -43,7 +43,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
     private func setupLocationManager() {
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
-        locationManager.distanceFilter = 8
+        locationManager.distanceFilter = 5
         locationManager.activityType = .otherNavigation
         locationManager.pausesLocationUpdatesAutomatically = false
         authorizationStatus = locationManager.authorizationStatus
@@ -79,9 +79,15 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             locationManager.requestAlwaysAuthorization()
             return
         }
-        locationManager.allowsBackgroundLocationUpdates = true
+        #if os(iOS)
+        if let backgroundModes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String],
+           backgroundModes.contains("location") {
+            locationManager.allowsBackgroundLocationUpdates = true
+        }
         locationManager.showsBackgroundLocationIndicator = true
+        #endif
         locationManager.startUpdatingLocation()
+        locationManager.requestLocation()
         startMotionTracking()
         isRecording = true
     }
@@ -128,6 +134,12 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             for location in locations {
                 await self.processLocation(location)
             }
+        }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in
+            self.logger.warning("Location manager error: \(error.localizedDescription, privacy: .public)")
         }
     }
 

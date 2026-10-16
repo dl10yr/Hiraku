@@ -6,11 +6,5 @@
 	<array>
 		<string>location</string>
 	</array>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>移動ログを記録し、訪れた場所の雲を晴らすために位置情報を使用します。</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>バックグラウンドでも移動ログを記録するために、常に位置情報を使用します。</string>
-	<key>NSMotionUsageDescription</key>
-	<string>徒歩・自転車・乗り物などの交通手段を判別するためにモーションデータを使用します。</string>
 </dict>
 </plist>
