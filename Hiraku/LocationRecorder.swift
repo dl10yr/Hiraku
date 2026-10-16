@@ -16,6 +16,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
     private let locationManager = CLLocationManager()
     private let activityManager = CMMotionActivityManager()
     private let pointStore: TrackPointStore
+    private var currentSessionID = UUID()
 
     override init() {
         let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
@@ -82,6 +83,7 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             locationManager.requestAlwaysAuthorization()
             return
         }
+        currentSessionID = UUID()
         #if os(iOS)
         if let backgroundModes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String],
            backgroundModes.contains("location") {
@@ -177,7 +179,8 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
             timestamp: location.timestamp,
             horizontalAccuracy: location.horizontalAccuracy,
             speed: max(0, location.speed),
-            mode: inferredMode
+            mode: inferredMode,
+            sessionID: currentSessionID
         )
         append(point: newPoint)
         lastLocation = location
@@ -288,7 +291,8 @@ final class LocationRecorder: NSObject, ObservableObject, CLLocationManagerDeleg
                 horizontalAccuracy: min(start.horizontalAccuracy, end.horizontalAccuracy),
                 speed: averageSpeed,
                 mode: mode,
-                isInterpolated: true
+                isInterpolated: true,
+                sessionID: currentSessionID
             )
             append(point: interpolatedPoint)
         }

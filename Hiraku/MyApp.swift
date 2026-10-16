@@ -17,41 +17,68 @@ struct MyApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ZStack(alignment: .bottom) {
-                FogMapView(
-                    points: filteredPoints,
-                    userLocation: recorder.lastLocation,
-                    centerOnUserTrigger: centerOnUserTrigger
-                )
-                .ignoresSafeArea()
+            NavigationStack {
+                ZStack(alignment: .bottom) {
+                    FogMapView(
+                        points: filteredPoints,
+                        userLocation: recorder.lastLocation,
+                        centerOnUserTrigger: centerOnUserTrigger
+                    )
+                    .ignoresSafeArea()
 
-                VStack {
-                    HStack {
+                    VStack {
+                        topBar
+
                         Spacer()
-                        Button {
-                            centerOnUserTrigger += 1
-                        } label: {
-                            Image(systemName: "location.fill")
-                                .font(.headline)
-                                .foregroundStyle(.primary)
-                                .frame(width: 44, height: 44)
-                                .background(.ultraThinMaterial, in: Circle())
-                        }
-                        .disabled(recorder.lastLocation == nil)
-                        .padding(.top, 12)
-                        .padding(.trailing, 16)
+
+                        controlBar
                     }
-
-                    Spacer()
-
-                    controlBar
                 }
-                .ignoresSafeArea(edges: .top)
-            }
-            .onAppear {
-                recorder.startOnLaunchIfNeeded()
+                .toolbar(.hidden, for: .navigationBar)
+                .onAppear {
+                    recorder.startOnLaunchIfNeeded()
+                }
             }
         }
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 10) {
+            NavigationLink {
+                HistoryListView(points: recorder.points)
+            } label: {
+                Image(systemName: "list.bullet")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+
+            NavigationLink {
+                SettingsView()
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+
+            Spacer()
+
+            Button {
+                centerOnUserTrigger += 1
+            } label: {
+                Image(systemName: "location.fill")
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .frame(width: 44, height: 44)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .disabled(recorder.lastLocation == nil)
+        }
+        .padding(.top, 8)
+        .padding(.horizontal, 16)
     }
 
     private var controlBar: some View {
