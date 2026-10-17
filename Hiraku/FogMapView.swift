@@ -14,7 +14,7 @@ struct FogMapView: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> MKMapView {
-        let mapView = MKMapView(frame: .zero)
+        let mapView = MKMapView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
         mapView.delegate = context.coordinator
         mapView.showsUserLocation = true
         mapView.showsCompass = true
