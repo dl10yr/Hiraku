@@ -15,7 +15,7 @@ struct HistoryListView: View {
                 ContentUnavailableView(
                     "計測履歴がありません",
                     systemImage: "point.topleft.down.curvedto.point.bottomright.up",
-                    description: Text("移動してGPSログが記録されると、ここに履歴が表示されます。")
+                    description: Text("徒歩または自転車で移動すると、ここに履歴が表示されます。")
                 )
             } else {
                 List(sessions) { session in
@@ -42,7 +42,7 @@ private struct HistoryRowView: View {
                 .font(.title3)
                 .foregroundStyle(.white)
                 .frame(width: 40, height: 40)
-                .background(Color.accentColor, in: Circle())
+                .background(session.primaryMode == .walk ? Color.blue : Color.orange, in: Circle())
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(dateRangeText)
@@ -92,20 +92,18 @@ private struct HistoryRowView: View {
     }
 }
 
-/// 計測詳細画面（開始〜終了までのルート全体が画面に収まるように線で描画）
+/// 計測詳細画面（Apple MapKit 上で開始〜終了までが1画面に収まるように線で描画）
 struct HistoryDetailView: View {
     let session: TrackSession
 
     var body: some View {
-        VStack(spacing: 0) {
-            SessionRouteMapView(points: session.points)
-                .ignoresSafeArea(edges: .bottom)
-                .overlay(alignment: .bottom) {
-                    summaryCard
-                }
-        }
-        .navigationTitle("計測詳細")
-        .navigationBarTitleDisplayMode(.inline)
+        SessionDetailMapView(session: session)
+            .ignoresSafeArea(edges: .bottom)
+            .overlay(alignment: .bottom) {
+                summaryCard
+            }
+            .navigationTitle("計測詳細")
+            .navigationBarTitleDisplayMode(.inline)
     }
 
     private var summaryCard: some View {
@@ -114,7 +112,7 @@ struct HistoryDetailView: View {
             Divider().frame(height: 32)
             statItem(title: "所要時間", value: formattedDuration)
             Divider().frame(height: 32)
-            statItem(title: "主な手段", value: session.primaryMode.label)
+            statItem(title: "移動手段", value: session.primaryMode.label)
             Divider().frame(height: 32)
             statItem(title: "記録数", value: "\(session.points.count)")
         }
@@ -155,26 +153,47 @@ struct HistoryDetailView: View {
     }
 }
 
-/// 開始から終了までが1画面に収まるように自動ズームし、ルートを線で描画するマップ
-struct SessionRouteMapView: View {
-    let points: [TrackPoint]
-    @State private var region: MKCoordinateRegion
+private struct SessionDetailMapView: UIViewRepresentable {
+    let session: TrackSession
 
-    init(points: [TrackPoint]) {
-        self.points = points
-        _region = State(initialValue: Self.fittingRegion(for: points))
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
     }
 
-    var body: some View {
-        ZStack {
-            RouteOSMMapRepresentable(
-                points: points,
-                initialRegion: Self.fittingRegion(for: points),
-                region: $region
-            )
-            RouteLineCanvas(points: points, region: region)
+    func makeUIView(context: Context) -> MKMapView {
+        let mapView = MKMapView(frame: .zero)
+        mapView.delegate = context.coordinator
+        mapView.showsUserLocation = false
+        mapView.isPitchEnabled = false
+
+        let coords = session.points.map(\.coordinate)
+        if coords.count >= 2 {
+            let poly = ModePolyline(coordinates: coords, count: coords.count)
+            poly.mode = session.primaryMode
+            mapView.addOverlay(poly, level: .aboveRoads)
         }
+
+        if let first = coords.first {
+            let startPin = MKPointAnnotation()
+            startPin.coordinate = first
+            startPin.title = "開始"
+            mapView.addAnnotation(startPin)
+        }
+
+        if let last = coords.last, coords.count > 1 {
+            let endPin = MKPointAnnotation()
+            endPin.coordinate = last
+            endPin.title = "終了"
+            mapView.addAnnotation(endPin)
+        }
+
+        let region = Self.fittingRegion(for: session.points)
+        mapView.setRegion(region, animated: false)
+
+        return mapView
     }
+
+    func updateUIView(_ mapView: MKMapView, context: Context) {}
 
     static func fittingRegion(for points: [TrackPoint]) -> MKCoordinateRegion {
         guard let first = points.first else {
@@ -202,155 +221,27 @@ struct SessionRouteMapView: View {
             longitude: (minLon + maxLon) / 2
         )
 
-        // 開始から終了まで余白を持って画面内に収まるようにSpanを計算（最低約400m四方）
-        let latSpan = max((maxLat - minLat) * 1.45, 0.004)
-        let lonSpan = max((maxLon - minLon) * 1.45, 0.004)
+        let latSpan = max((maxLat - minLat) * 1.5, 0.004)
+        let lonSpan = max((maxLon - minLon) * 1.5, 0.004)
 
         return MKCoordinateRegion(
             center: center,
             span: MKCoordinateSpan(latitudeDelta: latSpan, longitudeDelta: lonSpan)
         )
     }
-}
-
-private struct RouteOSMMapRepresentable: UIViewRepresentable {
-    let points: [TrackPoint]
-    let initialRegion: MKCoordinateRegion
-    @Binding var region: MKCoordinateRegion
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
-
-    func makeUIView(context: Context) -> MKMapView {
-        let mapView = MKMapView(frame: .zero)
-        mapView.delegate = context.coordinator
-        mapView.showsUserLocation = false
-        mapView.showsCompass = false
-        mapView.isPitchEnabled = false
-        mapView.isRotateEnabled = false
-
-        let osm = OSMTileOverlay()
-        mapView.addOverlay(osm, level: .aboveLabels)
-
-        DispatchQueue.main.async {
-            mapView.setRegion(initialRegion, animated: false)
-            context.coordinator.hasAppliedInitialRegion = true
-        }
-
-        return mapView
-    }
-
-    func updateUIView(_ mapView: MKMapView, context: Context) {
-        if !context.coordinator.hasAppliedInitialRegion, mapView.bounds.width > 0 {
-            context.coordinator.hasAppliedInitialRegion = true
-            mapView.setRegion(initialRegion, animated: false)
-        }
-    }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
-        var parent: RouteOSMMapRepresentable
-        var hasAppliedInitialRegion = false
-
-        init(_ parent: RouteOSMMapRepresentable) {
-            self.parent = parent
-        }
-
-        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
-            guard hasAppliedInitialRegion, mapView.bounds.width > 0 else { return }
-            let r = mapView.region
-            Task { @MainActor in
-                self.parent.region = r
-            }
-        }
-
-        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            guard hasAppliedInitialRegion, mapView.bounds.width > 0 else { return }
-            let r = mapView.region
-            Task { @MainActor in
-                self.parent.region = r
-            }
-        }
-
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            if let tileOverlay = overlay as? MKTileOverlay {
-                return MKTileOverlayRenderer(tileOverlay: tileOverlay)
+            if let poly = overlay as? ModePolyline {
+                let renderer = MKPolylineRenderer(polyline: poly)
+                renderer.strokeColor = poly.mode == .walk ? UIColor.systemBlue : UIColor.systemOrange
+                renderer.lineWidth = 6
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
         }
-    }
-}
-
-/// 開始〜終了の軌跡を線とマーカーで描画する Canvas
-private struct RouteLineCanvas: View {
-    let points: [TrackPoint]
-    let region: MKCoordinateRegion
-
-    var body: some View {
-        Canvas { context, size in
-            guard size.width > 0, size.height > 0, !points.isEmpty else { return }
-
-            let screenPoints = points.map { convertToScreen(coordinate: $0.coordinate, in: size, region: region) }
-
-            // ルート線を描画
-            if screenPoints.count >= 2 {
-                var path = Path()
-                path.move(to: screenPoints[0])
-                for pt in screenPoints.dropFirst() {
-                    path.addLine(to: pt)
-                }
-
-                // 白い縁取り
-                context.stroke(
-                    path,
-                    with: .color(.white.opacity(0.9)),
-                    style: StrokeStyle(lineWidth: 8, lineCap: .round, lineJoin: .round)
-                )
-                // メインのルート線（ブルー）
-                context.stroke(
-                    path,
-                    with: .color(.blue),
-                    style: StrokeStyle(lineWidth: 5, lineCap: .round, lineJoin: .round)
-                )
-            }
-
-            // 開始地点マーカー（緑）
-            if let startPt = screenPoints.first {
-                drawMarker(in: &context, at: startPt, color: .green)
-            }
-
-            // 終了地点マーカー（赤）
-            if let endPt = screenPoints.last, screenPoints.count > 1 {
-                drawMarker(in: &context, at: endPt, color: .red)
-            }
-        }
-        .allowsHitTesting(false)
-    }
-
-    private func drawMarker(in context: inout GraphicsContext, at point: CGPoint, color: Color) {
-        let outerRect = CGRect(x: point.x - 8, y: point.y - 8, width: 16, height: 16)
-        let innerRect = CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10)
-        context.fill(Path(ellipseIn: outerRect), with: .color(.white))
-        context.fill(Path(ellipseIn: innerRect), with: .color(color))
-    }
-
-    private func convertToScreen(
-        coordinate: CLLocationCoordinate2D,
-        in size: CGSize,
-        region: MKCoordinateRegion
-    ) -> CGPoint {
-        let minLat = region.center.latitude - region.span.latitudeDelta / 2
-        let maxLat = region.center.latitude + region.span.latitudeDelta / 2
-        let minLon = region.center.longitude - region.span.longitudeDelta / 2
-        let maxLon = region.center.longitude + region.span.longitudeDelta / 2
-
-        let xRatio = (coordinate.longitude - minLon) / max(maxLon - minLon, 0.000001)
-        let yRatio = (maxLat - coordinate.latitude) / max(maxLat - minLat, 0.000001)
-
-        return CGPoint(
-            x: CGFloat(xRatio) * size.width,
-            y: CGFloat(yRatio) * size.height
-        )
     }
 }
 

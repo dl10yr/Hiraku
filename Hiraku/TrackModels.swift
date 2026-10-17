@@ -4,17 +4,11 @@ import CoreLocation
 nonisolated enum TransportMode: String, Codable, CaseIterable, Sendable {
     case walk
     case cycle
-    case transit
-    case vehicle
-    case unknown
 
     var label: String {
         switch self {
         case .walk: "徒歩"
         case .cycle: "自転車"
-        case .transit: "電車・地下鉄"
-        case .vehicle: "車・乗り物"
-        case .unknown: "不明"
         }
     }
 
@@ -22,20 +16,14 @@ nonisolated enum TransportMode: String, Codable, CaseIterable, Sendable {
         switch self {
         case .walk: "figure.walk"
         case .cycle: "bicycle"
-        case .transit: "tram.fill"
-        case .vehicle: "car.fill"
-        case .unknown: "location.fill"
         }
-    }
-
-    var isWalking: Bool {
-        self == .walk
     }
 }
 
-nonisolated enum RevealFilter: String, CaseIterable, Identifiable, Sendable {
+nonisolated enum RouteFilter: String, CaseIterable, Identifiable, Sendable {
     case all = "すべて"
     case walkOnly = "徒歩のみ"
+    case cycleOnly = "自転車のみ"
 
     var id: String { rawValue }
 }
@@ -48,22 +36,53 @@ nonisolated struct TrackPoint: Identifiable, Codable, Sendable, Hashable {
     let horizontalAccuracy: Double
     let speed: Double
     var mode: TransportMode
-    var isInterpolated: Bool = false
-    /// 開始〜停止までの1回の計測セッションID（過去データでnilの場合は時間ギャップで自動分割）
-    var sessionID: UUID? = nil
+    var sessionID: UUID
 
     var coordinate: CLLocationCoordinate2D {
         CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
+}
 
-    /// この地点で開かれる雲の半径（メートル）
-    var revealRadius: CLLocationDistance {
-        switch mode {
-        case .walk: 45
-        case .cycle: 60
-        case .transit, .vehicle: 80
-        case .unknown: 45
+/// 連続して記録されたルートの1本のライン（徒歩または自転車）
+nonisolated struct RouteSegment: Identifiable, Sendable {
+    let id: UUID
+    let mode: TransportMode
+    let coordinates: [CLLocationCoordinate2D]
+
+    /// ポイント配列から、セッション切れや時間・距離の空白（3分または200m以上）で分割したライン群を生成
+    static func buildSegments(from points: [TrackPoint]) -> [RouteSegment] {
+        guard !points.isEmpty else { return [] }
+        let sorted = points.sorted { $0.timestamp < $1.timestamp }
+
+        var segments: [RouteSegment] = []
+        var currentCoords: [CLLocationCoordinate2D] = [sorted[0].coordinate]
+        var currentMode = sorted[0].mode
+        var prevPoint = sorted[0]
+
+        for pt in sorted.dropFirst() {
+            let dt = pt.timestamp.timeIntervalSince(prevPoint.timestamp)
+            let dist = CLLocation(latitude: pt.latitude, longitude: pt.longitude)
+                .distance(from: CLLocation(latitude: prevPoint.latitude, longitude: prevPoint.longitude))
+
+            let shouldSplit = pt.sessionID != prevPoint.sessionID || dt > 180 || dist > 200 || pt.mode != currentMode
+
+            if shouldSplit {
+                if currentCoords.count >= 2 {
+                    segments.append(RouteSegment(id: UUID(), mode: currentMode, coordinates: currentCoords))
+                }
+                currentCoords = [pt.coordinate]
+                currentMode = pt.mode
+            } else {
+                currentCoords.append(pt.coordinate)
+            }
+            prevPoint = pt
         }
+
+        if currentCoords.count >= 2 {
+            segments.append(RouteSegment(id: UUID(), mode: currentMode, coordinates: currentCoords))
+        }
+
+        return segments
     }
 }
 
@@ -109,29 +128,14 @@ nonisolated struct TrackSession: Identifiable, Hashable, Sendable {
         let sorted = allPoints.sorted { $0.timestamp < $1.timestamp }
 
         var sessions: [TrackSession] = []
-        var currentPoints: [TrackPoint] = []
-        var currentID = sorted[0].sessionID ?? sorted[0].id
+        var currentPoints: [TrackPoint] = [sorted[0]]
+        var currentID = sorted[0].sessionID
 
-        for pt in sorted {
-            if let prev = currentPoints.last {
-                let sessionChanged: Bool = {
-                    if let s1 = prev.sessionID, let s2 = pt.sessionID {
-                        return s1 != s2
-                    }
-                    if prev.sessionID != nil || pt.sessionID != nil {
-                        return true
-                    }
-                    // sessionID が無い旧データは 15分以上の空白で別セッションとみなす
-                    return pt.timestamp.timeIntervalSince(prev.timestamp) > 900
-                }()
-
-                if sessionChanged {
-                    sessions.append(TrackSession(id: currentID, points: currentPoints))
-                    currentPoints = [pt]
-                    currentID = pt.sessionID ?? pt.id
-                } else {
-                    currentPoints.append(pt)
-                }
+        for pt in sorted.dropFirst() {
+            if pt.sessionID != currentID {
+                sessions.append(TrackSession(id: currentID, points: currentPoints))
+                currentPoints = [pt]
+                currentID = pt.sessionID
             } else {
                 currentPoints.append(pt)
             }

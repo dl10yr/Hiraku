@@ -1,197 +1,49 @@
 import SwiftUI
 import MapKit
 
-/// OpenStreetMap タイルオーバーレイ（User-Agent ヘッダ付与）
-nonisolated final class OSMTileOverlay: MKTileOverlay {
-    private let session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.httpAdditionalHeaders = ["User-Agent": "Hiraku/1.0 (com.dl10yr.hiraku; iOS OSM FogMap)"]
-        return URLSession(configuration: config)
-    }()
-
-    init() {
-        super.init(urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-        // Apple Maps の標準ベクター描画（VectorKit）を置換して、OpenStreetMap のみ表示＆VectorKitのアサーションを防止
-        self.canReplaceMapContent = true
-        self.minimumZ = 0
-        self.maximumZ = 19
-    }
-
-    override func loadTile(at path: MKTileOverlayPath, result: @escaping (Data?, Error?) -> Void) {
-        let url = self.url(forTilePath: path)
-        session.dataTask(with: url) { data, response, error in
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                result(nil, error)
-                return
-            }
-            result(data, error)
-        }.resume()
-    }
-}
-
-/// 訪れた場所だけ雲（霧）をくり抜いて描画する Canvas オーバーレイ View
-/// MKMapView のカスタム MKOverlayRenderer ではなく SwiftUI Canvas で重畳することで、
-/// iOS 27 シミュレータの VectorKit アサーションクラッシュ（EaselUtilities.cpp:376）を完全に回避し、
-/// 60fps で滑らかなソフトエッジの雲を描画します。
-struct FogCanvasOverlay: View {
+/// Apple 標準の MKMapView を使い、記録された徒歩・自転車のログを Line（MKPolyline）として高速描画するメインマップ
+/// SwiftUI の Map + MapCameraPosition(.userLocation(fallback: .automatic)) は位置情報未確定かつポリラインが空の起動直後に
+/// 白画面で待機・再計算を繰り返すことがあるため、UIKit の MKMapView を直接ラップして起動0秒で確実に地図を表示します。
+struct FogMapView: UIViewRepresentable {
     let points: [TrackPoint]
-    let region: MKCoordinateRegion
-
-    var body: some View {
-        Canvas { context, size in
-            guard size.width > 0, size.height > 0 else { return }
-
-            // Canvas 内部を独立レイヤーにして destinationOut（くり抜き合成）を機能させる
-            context.drawLayer { layer in
-                // 1. 画面全体を「雲（白い霧〜スモーク）」で覆う
-                let fullRect = CGRect(origin: .zero, size: size)
-                layer.fill(
-                    Path(fullRect),
-                    with: .color(Color(red: 0.14, green: 0.17, blue: 0.22).opacity(0.76))
-                )
-
-                guard !points.isEmpty,
-                      region.span.latitudeDelta > 0,
-                      region.span.longitudeDelta > 0 else { return }
-
-                // 1メートルあたりの画面ピクセル数を算出
-                let metersPerDegreeLat = 111_132.0
-                let visibleMetersLat = region.span.latitudeDelta * metersPerDegreeLat
-                let pixelsPerMeter = size.height / max(visibleMetersLat, 1)
-
-                // 表示範囲＋マージン内のポイントだけ抽出
-                let latMargin = region.span.latitudeDelta * 0.6
-                let lonMargin = region.span.longitudeDelta * 0.6
-                let minLat = region.center.latitude - region.span.latitudeDelta / 2 - latMargin
-                let maxLat = region.center.latitude + region.span.latitudeDelta / 2 + latMargin
-                let minLon = region.center.longitude - region.span.longitudeDelta / 2 - lonMargin
-                let maxLon = region.center.longitude + region.span.longitudeDelta / 2 + lonMargin
-
-                let visiblePoints = points.filter { pt in
-                    pt.latitude >= minLat && pt.latitude <= maxLat &&
-                    pt.longitude >= minLon && pt.longitude <= maxLon
-                }
-
-                guard !visiblePoints.isEmpty else { return }
-
-                layer.blendMode = .destinationOut
-
-                // 2. 訪れた地点と連続する軌跡の雲をソフトエッジでくり抜く
-                for (index, pt) in visiblePoints.enumerated() {
-                    let screenPt = convertToScreen(
-                        coordinate: pt.coordinate,
-                        in: size,
-                        region: region
-                    )
-                    // ズームアウトしすぎた時でも最低 14pt は見えるようにする
-                    let radiusPx = max(14.0, CGFloat(pt.revealRadius) * pixelsPerMeter)
-
-                    // 外側のふんわりした境界（ソフトエッジ）
-                    let outerRadius = radiusPx * 1.45
-                    let outerRect = CGRect(
-                        x: screenPt.x - outerRadius,
-                        y: screenPt.y - outerRadius,
-                        width: outerRadius * 2,
-                        height: outerRadius * 2
-                    )
-                    layer.fill(
-                        Path(ellipseIn: outerRect),
-                        with: .radialGradient(
-                            Gradient(stops: [
-                                .init(color: .white, location: 0.0),
-                                .init(color: .white.opacity(0.85), location: 0.55),
-                                .init(color: .clear, location: 1.0)
-                            ]),
-                            center: screenPt,
-                            startRadius: 0,
-                            endRadius: outerRadius
-                        )
-                    )
-
-                    // 連続するポイント間を太いラインで繋ぐ
-                    if index > 0 {
-                        let prev = visiblePoints[index - 1]
-                        let dt = pt.timestamp.timeIntervalSince(prev.timestamp)
-                        let dist = CLLocation(latitude: pt.latitude, longitude: pt.longitude)
-                            .distance(from: CLLocation(latitude: prev.latitude, longitude: prev.longitude))
-                        if dt <= 240 && dist <= 400 {
-                            let prevScreenPt = convertToScreen(
-                                coordinate: prev.coordinate,
-                                in: size,
-                                region: region
-                            )
-                            var linePath = Path()
-                            linePath.move(to: prevScreenPt)
-                            linePath.addLine(to: screenPt)
-
-                            layer.stroke(
-                                linePath,
-                                with: .color(.white.opacity(0.45)),
-                                style: StrokeStyle(lineWidth: radiusPx * 2.5, lineCap: .round, lineJoin: .round)
-                            )
-                            layer.stroke(
-                                linePath,
-                                with: .color(.white),
-                                style: StrokeStyle(lineWidth: radiusPx * 1.8, lineCap: .round, lineJoin: .round)
-                            )
-                        }
-                    }
-                }
-            }
-        }
-        .allowsHitTesting(false)
-    }
-
-    private func convertToScreen(
-        coordinate: CLLocationCoordinate2D,
-        in size: CGSize,
-        region: MKCoordinateRegion
-    ) -> CGPoint {
-        let minLat = region.center.latitude - region.span.latitudeDelta / 2
-        let maxLat = region.center.latitude + region.span.latitudeDelta / 2
-        let minLon = region.center.longitude - region.span.longitudeDelta / 2
-        let maxLon = region.center.longitude + region.span.longitudeDelta / 2
-
-        let xRatio = (coordinate.longitude - minLon) / max(maxLon - minLon, 0.000001)
-        let yRatio = (maxLat - coordinate.latitude) / max(maxLat - minLat, 0.000001)
-
-        return CGPoint(
-            x: CGFloat(xRatio) * size.width,
-            y: CGFloat(yRatio) * size.height
-        )
-    }
-}
-
-/// OpenStreetMap タイルを表示し、カメラ移動をリアルタイムに通知する MKMapView ラッパー
-struct OSMMapView: UIViewRepresentable {
     let userLocation: CLLocation?
     let centerOnUserTrigger: Int
-    @Binding var region: MKCoordinateRegion
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+        Coordinator()
     }
 
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView(frame: .zero)
         mapView.delegate = context.coordinator
         mapView.showsUserLocation = true
-        mapView.showsCompass = false
+        mapView.showsCompass = true
         mapView.isPitchEnabled = false
-        mapView.isRotateEnabled = false
 
-        let osm = OSMTileOverlay()
-        mapView.addOverlay(osm, level: .aboveLabels)
-
+        // 起動直後に真っ白にならないよう、即座に初期リージョン（現在地があれば現在地、なければ日本全体〜東京）をセット
         if let loc = userLocation {
             context.coordinator.hasCenteredOnUser = true
-            center(mapView, on: loc, animated: false)
+            context.coordinator.lastCenteredLocation = loc
+            let region = MKCoordinateRegion(
+                center: loc.coordinate,
+                latitudinalMeters: 800,
+                longitudinalMeters: 800
+            )
+            mapView.setRegion(region, animated: false)
+        } else {
+            let defaultRegion = MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 35.6812, longitude: 139.7671),
+                latitudinalMeters: 5000,
+                longitudinalMeters: 5000
+            )
+            mapView.setRegion(defaultRegion, animated: false)
         }
 
         return mapView
     }
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
+        // 1. 初回測位時または 2km 以上ジャンプした時に自動で現在地へ移動
         if let loc = userLocation {
             let jumpedFar: Bool = {
                 guard let lastCentered = context.coordinator.lastCenteredLocation else { return true }
@@ -205,78 +57,80 @@ struct OSMMapView: UIViewRepresentable {
             }
         }
 
-        if context.coordinator.lastCenterTrigger != centerOnUserTrigger, let loc = userLocation {
+        // 2. 右上の現在地ボタンが押された時
+        if context.coordinator.lastCenterTrigger != centerOnUserTrigger {
             context.coordinator.lastCenterTrigger = centerOnUserTrigger
-            context.coordinator.hasCenteredOnUser = true
-            context.coordinator.lastCenteredLocation = loc
-            center(mapView, on: loc, animated: true)
+            if let loc = userLocation ?? mapView.userLocation.location {
+                context.coordinator.hasCenteredOnUser = true
+                context.coordinator.lastCenteredLocation = loc
+                center(mapView, on: loc, animated: true)
+            }
+        }
+
+        // 3. ポイント配列が変化した時だけ MKPolyline を差分更新（毎フレーム再生成による重さを防止）
+        let firstID = points.first?.id
+        let lastID = points.last?.id
+        if context.coordinator.renderedCount != points.count ||
+           context.coordinator.renderedFirstID != firstID ||
+           context.coordinator.renderedLastID != lastID {
+            context.coordinator.renderedCount = points.count
+            context.coordinator.renderedFirstID = firstID
+            context.coordinator.renderedLastID = lastID
+
+            mapView.removeOverlays(mapView.overlays)
+            let segments = RouteSegment.buildSegments(from: points)
+            let polylines: [ModePolyline] = segments.map { seg in
+                let poly = ModePolyline(coordinates: seg.coordinates, count: seg.coordinates.count)
+                poly.mode = seg.mode
+                return poly
+            }
+            mapView.addOverlays(polylines, level: .aboveRoads)
         }
     }
 
     private func center(_ mapView: MKMapView, on location: CLLocation, animated: Bool) {
-        let newRegion = MKCoordinateRegion(
+        let region = MKCoordinateRegion(
             center: location.coordinate,
-            latitudinalMeters: 1000,
-            longitudinalMeters: 1000
+            latitudinalMeters: 800,
+            longitudinalMeters: 800
         )
-        mapView.setRegion(newRegion, animated: animated)
+        mapView.setRegion(region, animated: animated)
     }
 
     final class Coordinator: NSObject, MKMapViewDelegate {
-        var parent: OSMMapView
         var hasCenteredOnUser = false
         var lastCenteredLocation: CLLocation?
         var lastCenterTrigger = 0
+        var renderedCount = -1
+        var renderedFirstID: UUID?
+        var renderedLastID: UUID?
 
-        init(_ parent: OSMMapView) {
-            self.parent = parent
-        }
-
-        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
-            let currentRegion = mapView.region
-            Task { @MainActor in
-                self.parent.region = currentRegion
-            }
-        }
-
-        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            let currentRegion = mapView.region
-            Task { @MainActor in
-                self.parent.region = currentRegion
-            }
+        func mapView(_ mapView: MKMapView, didUpdate userLocation: MKUserLocation) {
+            guard !hasCenteredOnUser, let loc = userLocation.location else { return }
+            hasCenteredOnUser = true
+            lastCenteredLocation = loc
+            let region = MKCoordinateRegion(
+                center: loc.coordinate,
+                latitudinalMeters: 800,
+                longitudinalMeters: 800
+            )
+            mapView.setRegion(region, animated: true)
         }
 
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            if let tileOverlay = overlay as? MKTileOverlay {
-                return MKTileOverlayRenderer(tileOverlay: tileOverlay)
+            if let poly = overlay as? ModePolyline {
+                let renderer = MKPolylineRenderer(polyline: poly)
+                renderer.strokeColor = poly.mode == .walk ? UIColor.systemBlue : UIColor.systemOrange
+                renderer.lineWidth = 5
+                renderer.lineCap = .round
+                renderer.lineJoin = .round
+                return renderer
             }
             return MKOverlayRenderer(overlay: overlay)
         }
     }
 }
 
-struct FogMapView: View {
-    let points: [TrackPoint]
-    let userLocation: CLLocation?
-    let centerOnUserTrigger: Int
-
-    @State private var region = MKCoordinateRegion(
-        center: CLLocationCoordinate2D(latitude: 37.3346, longitude: -122.0090),
-        latitudinalMeters: 2000,
-        longitudinalMeters: 2000
-    )
-
-    var body: some View {
-        ZStack {
-            OSMMapView(
-                userLocation: userLocation,
-                centerOnUserTrigger: centerOnUserTrigger,
-                region: $region
-            )
-            FogCanvasOverlay(
-                points: points,
-                region: region
-            )
-        }
-    }
+final class ModePolyline: MKPolyline {
+    var mode: TransportMode = .walk
 }

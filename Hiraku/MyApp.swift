@@ -3,7 +3,7 @@ import SwiftUI
 @main
 struct MyApp: App {
     @StateObject private var recorder = LocationRecorder()
-    @State private var filter: RevealFilter = .all
+    @State private var filter: RouteFilter = .all
     @State private var centerOnUserTrigger = 0
 
     private var filteredPoints: [TrackPoint] {
@@ -11,7 +11,9 @@ struct MyApp: App {
         case .all:
             recorder.points
         case .walkOnly:
-            recorder.points.filter { $0.mode.isWalking }
+            recorder.points.filter { $0.mode == .walk }
+        case .cycleOnly:
+            recorder.points.filter { $0.mode == .cycle }
         }
     }
 
@@ -75,16 +77,24 @@ struct MyApp: App {
                     .frame(width: 44, height: 44)
                     .background(.ultraThinMaterial, in: Circle())
             }
-            .disabled(recorder.lastLocation == nil)
         }
         .padding(.top, 8)
         .padding(.horizontal, 16)
     }
 
+    private var statusText: String {
+        guard recorder.isRecording else { return "停止中" }
+        if let mode = recorder.detectedMode {
+            return "記録中 (\(mode.label))"
+        } else {
+            return "待機中 (徒歩・自転車のみ記録)"
+        }
+    }
+
     private var controlBar: some View {
         VStack(spacing: 12) {
             Picker("表示フィルター", selection: $filter) {
-                ForEach(RevealFilter.allCases) { item in
+                ForEach(RouteFilter.allCases) { item in
                     Text(item.rawValue).tag(item)
                 }
             }
@@ -94,9 +104,9 @@ struct MyApp: App {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(recorder.isRecording ? Color.green : Color.secondary)
+                            .fill(recorder.isRecording ? (recorder.detectedMode != nil ? Color.green : Color.orange) : Color.secondary)
                             .frame(width: 8, height: 8)
-                        Text(recorder.isRecording ? "計測中 (\(recorder.currentMode.label))" : "停止中")
+                        Text(statusText)
                             .font(.subheadline.weight(.semibold))
                     }
                     Text("累計 \(filteredPoints.count) 地点")
